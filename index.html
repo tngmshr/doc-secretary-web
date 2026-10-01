@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="書類秘書">
+<meta name="theme-color" content="#2f6f5e">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<title>書類秘書</title>
+<style>
+:root{--bg:#f6f7f6;--card:#fff;--fg:#1d2b27;--sub:#66756f;--pri:#2f6f5e;--warn:#b3541e;--bad:#b3261e;--line:#dfe5e2}
+@media(prefers-color-scheme:dark){:root{--bg:#121614;--card:#1c221f;--fg:#e6ece9;--sub:#9aa9a2;--pri:#6fc2a9;--warn:#e0905a;--bad:#f2766d;--line:#2d3632}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 -apple-system,"Hiragino Sans",sans-serif;padding-bottom:calc(90px + env(safe-area-inset-bottom))}
+header{position:sticky;top:0;background:var(--pri);color:#fff;padding:calc(10px + env(safe-area-inset-top)) 16px 10px;display:flex;align-items:center;gap:8px;z-index:5}
+header h1{font-size:18px;margin:0;flex:1}
+header button{background:none;border:0;color:#fff;font-size:15px;padding:6px}
+main{padding:12px 16px;max-width:640px;margin:0 auto}
+h2{font-size:14px;color:var(--sub);margin:20px 0 6px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:8px}
+.card.click{cursor:pointer}
+.row{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
+.t{font-weight:600}.s{color:var(--sub);font-size:14px}
+.due{font-weight:600}.over{color:var(--bad)}.soon{color:var(--warn)}
+.fab{position:fixed;right:16px;bottom:calc(16px + env(safe-area-inset-bottom));background:var(--pri);color:#fff;border:0;border-radius:28px;padding:14px 22px;font-size:16px;box-shadow:0 2px 8px #0004}
+label{display:block;font-size:13px;color:var(--sub);margin:12px 0 2px}
+input,select,textarea{width:100%;font-size:16px;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg)}
+.btn{display:block;width:100%;background:var(--pri);color:#fff;border:0;border-radius:10px;padding:13px;font-size:16px;margin-top:12px}
+.btn.sec{background:none;color:var(--pri);border:1px solid var(--pri)}
+.btn.bad{background:none;color:var(--bad);border:1px solid var(--bad)}
+.warn{background:#fff3e6;color:#7a3a10;border-radius:8px;padding:8px 10px;margin:6px 0;font-size:14px}
+@media(prefers-color-scheme:dark){.warn{background:#3a2a1c;color:#f0c9a8}}
+img.doc{width:100%;border-radius:8px;margin-top:8px}
+.note{font-size:13px;color:var(--sub)}
+.spin{text-align:center;padding:40px 0;color:var(--sub)}
+</style>
+</head>
+<body>
+<header><button id="back" hidden>‹ 戻る</button><h1 id="title">書類秘書</h1><button id="gear">設定</button></header>
+<main id="main"></main>
+<input id="file" type="file" accept="image/*" hidden>
+<script>
+'use strict';
+// ---------- 設定（端末の localStorage のみ。外部へ送るのは Gemini への画像送信だけ） ----------
+const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
+const ls = {
+  get(k, d = '') { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); return true; } catch { return false; } },
+};
+// ---------- IndexedDB ----------
+let db;
+function openDb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('docsec', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('docs', { keyPath: 'id' });
+    r.onsuccess = () => { db = r.result; res(); };
+    r.onerror = () => rej(r.error);
+  });
+}
+const tx = (mode) => db.transaction('docs', mode).objectStore('docs');
+const reqp = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+const allDocs = () => reqp(tx('readonly').getAll());
+const putDoc = (d) => reqp(tx('readwrite').put(d));
+const delDoc = (id) => reqp(tx('readwrite').delete(id));
+
+// ---------- Gemini ----------
+const prompt = (today) => `あなたは日本の生活書類（請求書・納税通知・保険・役所・学校のお知らせ等）を読み取るアシスタントです。
+画像を読み、次のJSONだけを返してください。書かれていない項目は null。推測で埋めない。
+- doc_type: 書類の種類（短く）
+- issuer: 発行元
+- amount: 支払・請求金額（円、整数）。無ければ null
+- due_date: 対応期限（YYYY-MM-DD）。和暦は西暦に換算。期限が複数なら、最も重要な「支払期限/提出期限/手続期限」を1つ。発行日・作成日と混同しない
+- action_required: ユーザーが何か行動する必要があるか（bool）
+- action_text: 必要な行動（1文）。不要なら null
+- importance: 高/中/低
+- category: 対応必要/読むだけ/保存のみ/不要 のいずれか
+- evidence_text: 期限と金額の根拠になった原文の該当部分（そのまま抜粋）
+- confidence: 0〜1 の確信度
+今日の日付は ${today} です。`;
+const schema = {
+  type: 'OBJECT',
+  properties: {
+    doc_type: { type: 'STRING', nullable: true }, issuer: { type: 'STRING', nullable: true },
+    amount: { type: 'INTEGER', nullable: true }, due_date: { type: 'STRING', nullable: true },
+    action_required: { type: 'BOOLEAN' }, action_text: { type: 'STRING', nullable: true },
+    importance: { type: 'STRING' }, category: { type: 'STRING' },
+    evidence_text: { type: 'STRING', nullable: true }, confidence: { type: 'NUMBER' },
+  },
+  required: ['action_required', 'importance', 'category', 'confidence'],
+};
+const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+async function extract(blob) {
+  const key = ls.get('key').trim();
+  if (!key) throw new Error('設定で Gemini の API キーを入力してください');
+  const model = ls.get('model') || DEFAULT_MODEL;
+  const b64 = await new Promise((res) => { const f = new FileReader(); f.onload = () => res(f.result.split(',')[1]); f.readAsDataURL(blob); });
+  const body = JSON.stringify({
+    contents: [{ parts: [{ text: prompt(ymd(new Date())) }, { inline_data: { mime_type: 'image/jpeg', data: b64 } }] }],
+    generationConfig: { responseMimeType: 'application/json', responseSchema: schema, temperature: 0 },
+  });
+  let r;
+  try {
+    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 90000);
+    r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body, signal: ctl.signal });
+    clearTimeout(t);
+  } catch (e) { throw new Error(`通信に失敗しました（${e.name}）。電波の状態を確認してください`); }
+  if (r.status === 429) throw new Error('利用上限に達しました。しばらく待つか、別のモデルを設定してください');
+  if (r.status === 404) throw new Error(`モデル「${model}」が使えません。設定でモデル名を変更してください`);
+  if (r.status === 400 || r.status === 403) throw new Error(`API キーが正しくない可能性があります（${r.status}）`);
+  if (!r.ok) throw new Error(`抽出に失敗しました（${r.status}）`);
+  let j;
+  try { j = JSON.parse((await r.json()).candidates[0].content.parts[0].text); }
+  catch { throw new Error('読み取り結果を解釈できませんでした。撮り直してください'); }
+  const due = j.due_date && /^\d{4}-\d{2}-\d{2}$/.test(j.due_date) ? j.due_date : '';
+  return {
+    docType: j.doc_type || '', issuer: j.issuer || '', amount: j.amount ?? null, dueDate: due,
+    actionRequired: !!j.action_required, actionText: j.action_text || '',
+    category: j.category || '対応必要', evidence: j.evidence_text || '', confidence: typeof j.confidence === 'number' ? j.confidence : 0.5,
+  };
+}
+function sanity(d) {
+  const w = [], t0 = new Date(); t0.setHours(0, 0, 0, 0);
+  if (d.dueDate) {
+    const due = new Date(d.dueDate + 'T00:00:00');
+    if (due < new Date(t0.getTime() - 30 * 864e5)) w.push('期限が30日以上前です。読み違いがないか確認してください');
+    if (due > new Date(t0.getTime() + 1100 * 864e5)) w.push('期限が3年以上先です。読み違いがないか確認してください');
+  }
+  if (d.amount != null && (d.amount >= 1e7 || d.amount < 0)) w.push('金額が大きすぎます。桁ずれがないか確認してください');
+  if (d.actionRequired && !d.dueDate) w.push('対応が必要ですが期限が読み取れていません');
+  if (d.confidence < 0.7) w.push('AI の確信度が低めです。原本と照らして確認してください');
+  return w;
+}
+// ---------- 画像の縮小（長辺1600px、JPEG） ----------
+function shrink(file) {
+  return new Promise((res, rej) => {
+    const img = new Image(), url = URL.createObjectURL(file);
+    img.onload = () => {
+      const k = Math.min(1, 1600 / Math.max(img.width, img.height));
+      const c = document.createElement('canvas'); c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      c.toBlob((b) => b ? res(b) : rej(new Error('画像を変換できませんでした')), 'image/jpeg', 0.85);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); rej(new Error('この画像は読み込めません（PDFは未対応です）')); };
+    img.src = url;
+  });
+}
+// ---------- カレンダー(.ics) ----------
+const icsEsc = (s) => String(s).replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\n/g, '\\n');
+function makeIcs(d) {
+  const day = d.dueDate.replace(/-/g, '');
+  const next = new Date(d.dueDate + 'T00:00:00'); next.setDate(next.getDate() + 1);
+  const end = ymd(next).replace(/-/g, '');
+  const title = `${d.docType || '書類の期限'}${d.amount != null ? `（${d.amount}円）` : ''}`;
+  const alarm = (trig, text) => `BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:${icsEsc(text)}\r\nTRIGGER;RELATED=START:${trig}\r\nEND:VALARM`;
+  return ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//docsec//JA', 'BEGIN:VEVENT',
+    `UID:docsec-${d.id}@local`, `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').slice(0, 15)}Z`,
+    `DTSTART;VALUE=DATE:${day}`, `DTEND;VALUE=DATE:${end}`, `SUMMARY:${icsEsc(title)}`,
+    `DESCRIPTION:${icsEsc((d.actionText || '対応が必要です') + (d.issuer ? `\n発行元: ${d.issuer}` : ''))}`,
+    alarm('-P2DT15H', `あと3日：${title}`), alarm('-PT15H', `あと1日：${title}`), alarm('PT9H', `今日が期限です：${title}`),
+    'END:VEVENT', 'END:VCALENDAR'].join('\r\n');
+}
+function download(name, blob) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+}
+// ---------- 画面 ----------
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const isTask = (d) => d.actionRequired && d.category === '対応必要';
+const today0 = () => { const t = new Date(); t.setHours(0, 0, 0, 0); return t; };
+const daysTo = (s) => Math.round((new Date(s + 'T00:00:00') - today0()) / 864e5);
+const nav = { stack: [] };
+function setView(title, html, back) {
+  $('#title').textContent = title; $('#main').innerHTML = html;
+  $('#back').hidden = !back; $('#back').onclick = back || null; $('#gear').hidden = !!back;
+  window.scrollTo(0, 0);
+}
+function cardHtml(d) {
+  let due = '';
+  if (d.dueDate && isTask(d) && !d.done) {
+    const n = daysTo(d.dueDate);
+    due = `<span class="due ${n < 0 ? 'over' : n <= 3 ? 'soon' : ''}">${n < 0 ? `${-n}日超過` : n === 0 ? '今日' : `あと${n}日`}</span>`;
+  }
+  return `<div class="card click" data-id="${d.id}"><div class="row"><span class="t">${esc(d.docType || '書類')}</span>${due}</div>
+  <div class="s">${esc(d.issuer)}${d.amount != null ? ` ／ ${d.amount.toLocaleString()}円` : ''}${d.dueDate ? ` ／ 期限 ${esc(d.dueDate)}` : ''}</div>
+  ${d.actionText ? `<div class="s">${esc(d.actionText)}</div>` : ''}</div>`;
+}
+async function home() {
+  const items = (await allDocs()).sort((a, b) => b.createdAt - a.createdAt);
+  const open = items.filter((d) => !d.done);
+  const tasks = open.filter(isTask);
+  const t0 = today0(), wk = new Date(t0.getTime() + 7 * 864e5);
+  const dated = (d) => (d.dueDate ? new Date(d.dueDate + 'T00:00:00') : null);
+  const sections = [
+    ['期限超過', tasks.filter((d) => dated(d) && dated(d) < t0)],
+    ['今日', tasks.filter((d) => dated(d) && +dated(d) === +t0)],
+    ['今週', tasks.filter((d) => dated(d) && dated(d) > t0 && dated(d) <= wk)],
+    ['それ以降・期限不明', tasks.filter((d) => !dated(d) || dated(d) > wk)],
+    ['保管（対応不要）', open.filter((d) => !isTask(d))],
+    ['完了', items.filter((d) => d.done)],
+  ];
+  sections.forEach((s) => s[1].sort((a, b) => (a.dueDate || '9').localeCompare(b.dueDate || '9')));
+  let html = sections.filter((s) => s[1].length).map(([n, l]) => `<h2>${n}（${l.length}）</h2>${l.map(cardHtml).join('')}`).join('');
+  if (!items.length) html = '<div class="spin">書類の写真を撮ると、期限と対応を読み取ります。<br>右下の「撮影」から始めてください。</div>';
+  setView('書類秘書', html + '<button class="fab" id="add">＋ 撮影</button>');
+  $('#add').onclick = () => $('#file').click();
+  document.querySelectorAll('.card.click').forEach((c) => (c.onclick = () => detail(+c.dataset.id)));
+}
+$('#file').onchange = async (e) => {
+  const f = e.target.files[0]; e.target.value = '';
+  if (!f) return;
+  setView('読み取り中', '<div class="spin">読み取り中…（数秒かかります）</div>');
+  try {
+    const blob = await shrink(f);
+    const fields = await extract(blob);
+    confirmView({ id: Date.now(), image: blob, done: false, createdAt: Date.now(), ...fields }, true);
+  } catch (err) {
+    setView('エラー', `<div class="warn">${esc(err.message)}</div><button class="btn" id="ok">戻る</button>`);
+    $('#ok').onclick = home;
+  }
+};
+function field(label, id, val, type = 'text') {
+  return `<label for="${id}">${label}</label><input id="${id}" type="${type}" value="${esc(val ?? '')}">`;
+}
+function confirmView(d, isNew) {
+  const w = sanity(d);
+  const cats = ['対応必要', '読むだけ', '保存のみ', '不要'];
+  setView(isNew ? '内容の確認' : '内容の修正',
+    `${w.map((x) => `<div class="warn">⚠ ${esc(x)}</div>`).join('')}
+    <div class="note">AI の読み取りは間違うことがあります。原本と見比べて直してください。</div>
+    ${field('書類の種類', 'f_type', d.docType)}${field('発行元', 'f_issuer', d.issuer)}
+    ${field('金額（円）', 'f_amount', d.amount ?? '', 'number')}${field('期限', 'f_due', d.dueDate, 'date')}
+    ${field('やること', 'f_act', d.actionText)}
+    <label for="f_cat">分類</label><select id="f_cat">${cats.map((c) => `<option ${c === d.category ? 'selected' : ''}>${c}</option>`).join('')}</select>
+    ${d.evidence ? `<label>根拠となった原文</label><div class="card s">${esc(d.evidence)}</div>` : ''}
+    <button class="btn" id="save">保存する</button>`,
+    isNew ? home : () => detail(d.id));
+  $('#save').onclick = async () => {
+    d.docType = $('#f_type').value.trim(); d.issuer = $('#f_issuer').value.trim();
+    d.amount = $('#f_amount').value === '' ? null : parseInt($('#f_amount').value, 10);
+    d.dueDate = $('#f_due').value; d.actionText = $('#f_act').value.trim(); d.category = $('#f_cat').value;
+    d.actionRequired = d.category === '対応必要';
+    try { await putDoc(d); } catch { alert('保存に失敗しました。端末の空き容量を確認してください'); return; }
+    isNew ? (d.dueDate && isTask(d) ? detail(d.id) : home()) : detail(d.id);
+  };
+}
+async function detail(id) {
+  const d = (await allDocs()).find((x) => x.id === id);
+  if (!d) return home();
+  const url = URL.createObjectURL(d.image);
+  setView(d.docType || '書類',
+    `<div class="card"><div class="t">${esc(d.docType)}</div><div class="s">${esc(d.issuer)}</div>
+    ${d.amount != null ? `<div>金額 ${d.amount.toLocaleString()}円</div>` : ''}
+    <div>期限 ${esc(d.dueDate || '不明')}</div>${d.actionText ? `<div>やること：${esc(d.actionText)}</div>` : ''}
+    <div class="s">分類：${esc(d.category)}${d.done ? '（完了）' : ''}</div></div>
+    ${d.dueDate && isTask(d) && !d.done ? '<button class="btn" id="ics">カレンダーに登録（3日前・前日・当日に通知）</button><div class="note">ボタンを押すと iPhone の「カレンダーに追加」画面が開きます。</div>' : ''}
+    <button class="btn sec" id="done">${d.done ? '未完了に戻す' : '完了にする'}</button>
+    <button class="btn sec" id="edit">内容を修正</button>
+    <button class="btn bad" id="del">削除</button>
+    <img class="doc" src="${url}" alt="原本">`, () => { URL.revokeObjectURL(url); home(); });
+  const ic = $('#ics'); if (ic) ic.onclick = () => download(`期限_${d.dueDate}.ics`, new Blob([makeIcs(d)], { type: 'text/calendar' }));
+  $('#done').onclick = async () => { d.done = !d.done; await putDoc(d); detail(id); };
+  $('#edit').onclick = () => confirmView(d, false);
+  $('#del').onclick = async () => { if (confirm('この書類を削除しますか？')) { await delDoc(id); home(); } };
+}
+function settings() {
+  const k = ls.get('key');
+  setView('設定',
+    `<label for="s_key">Gemini API キー</label><input id="s_key" type="password" autocomplete="off" placeholder="${k ? `保存済み（${k.length}文字）。入力すると上書き` : '未設定'}">
+    <div class="note">キーはこの端末のブラウザ内にだけ保存されます。</div>
+    ${field('モデル名', 's_model', ls.get('model') || DEFAULT_MODEL)}
+    <button class="btn" id="s_save">保存</button>
+    <h2>バックアップ</h2>
+    <div class="note">iPhone は長期間使わないとブラウザのデータを消すことがあります。定期的に書き出してください。</div>
+    <button class="btn sec" id="exp">書き出す（画像込み）</button>
+    <button class="btn sec" id="imp">読み込む</button><input id="impf" type="file" accept="application/json" hidden>
+    <h2>プライバシー</h2>
+    <div class="note">書類データはこの端末の中にだけ保存されます。読み取りのとき、撮影した画像が Google の Gemini API に送られます。無料枠では、送った内容が Google の製品改善に使われる場合があります。マイナンバー・口座番号・病名などが写る書類は撮らないでください。</div>`,
+    home);
+  $('#s_save').onclick = () => {
+    const nk = $('#s_key').value.trim();
+    if (nk && /[^\x21-\x7e]/.test(nk)) return alert('キーに全角文字や空白が混ざっています。コピーし直してください');
+    if (nk && !ls.set('key', nk)) return alert('保存に失敗しました（プライベートブラウズでは保存できません）');
+    ls.set('model', $('#s_model').value.trim() || DEFAULT_MODEL);
+    alert(nk ? 'API キーを保存しました' : '保存しました'); settings();
+  };
+  $('#exp').onclick = async () => {
+    const items = await allDocs();
+    const out = await Promise.all(items.map(async (d) => ({ ...d, image: await new Promise((r) => { const f = new FileReader(); f.onload = () => r(f.result); f.readAsDataURL(d.image); }) })));
+    download(`書類秘書_backup_${ymd(new Date())}.json`, new Blob([JSON.stringify(out)], { type: 'application/json' }));
+  };
+  $('#imp').onclick = () => $('#impf').click();
+  $('#impf').onchange = async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    try {
+      const arr = JSON.parse(await f.text());
+      for (const d of arr) { d.image = await (await fetch(d.image)).blob(); await putDoc(d); }
+      alert(`${arr.length}件を読み込みました`); home();
+    } catch { alert('読み込めませんでした。書き出したファイルを選んでください'); }
+  };
+}
+$('#gear').onclick = settings;
+openDb().then(home).catch(() => setView('エラー', '<div class="warn">この環境では保存領域を使えません（プライベートブラウズ等）。通常のSafariで開いてください。</div>'));
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+</script>
+</body>
+</html>
