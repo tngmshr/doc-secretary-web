@@ -91,6 +91,8 @@ const schema = {
   required: ['action_required', 'importance', 'category', 'confidence'],
 };
 const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+// 2月30日のような実在しない日付は、ブラウザによって翌月に繰り越したり Invalid Date になったりするので弾く。
+const validYmd = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && ymd(new Date(s + 'T00:00:00')) === s;
 
 async function extract(blob) {
   const key = ls.get('key').trim();
@@ -115,7 +117,7 @@ async function extract(blob) {
   let j;
   try { j = JSON.parse((await r.json()).candidates[0].content.parts[0].text); }
   catch { throw new Error('読み取り結果を解釈できませんでした。撮り直してください'); }
-  const due = j.due_date && /^\d{4}-\d{2}-\d{2}$/.test(j.due_date) ? j.due_date : '';
+  const due = validYmd(j.due_date) ? j.due_date : '';
   return {
     docType: j.doc_type || '', issuer: j.issuer || '', amount: j.amount ?? null, dueDate: due,
     actionRequired: !!j.action_required, actionText: j.action_text || '',
@@ -299,8 +301,11 @@ function settings() {
     const f = e.target.files[0]; if (!f) return;
     try {
       const arr = JSON.parse(await f.text());
-      for (const d of arr) { d.image = await (await fetch(d.image)).blob(); await putDoc(d); }
-      alert(`${arr.length}件を読み込みました`); home();
+      if (!Array.isArray(arr) || arr.some((d) => !d || d.id == null || typeof d.image !== 'string' || !d.image.startsWith('data:image/'))) throw new Error('形式が違う');
+      // 全件の画像を戻せると確かめてから書き込み、途中で失敗して一部だけ入るのを防ぐ。
+      const docs = await Promise.all(arr.map(async (d) => ({ ...d, image: await (await fetch(d.image)).blob() })));
+      for (const d of docs) await putDoc(d);
+      alert(`${docs.length}件を読み込みました`); home();
     } catch { alert('読み込めませんでした。書き出したファイルを選んでください'); }
   };
 }
